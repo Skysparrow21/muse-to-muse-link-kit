@@ -40,9 +40,10 @@ and the file server already handles the cases that broke the first link.
 - `relay/` - the relay server (`muse_relay.py`), a one-time firewall
   rule, a manual run script, and a setup script that installs it as a
   SYSTEM task starting at boot.
-- `files/` - the file server (`muse_files.py`, v4: resumable uploads,
-  replace route, log rotation, backup pruning), its own setup script,
-  and its README with the full endpoint list.
+- `files/` - the file server (`muse_files.py`, v5: delete to trash,
+  rename/move, mkdir, plus resumable uploads, replace route, log
+  rotation, backup pruning), its own setup script, and its README
+  with the full endpoint list.
 - `muse/` - `relay_client.py`, the client library and CLI the Muses
   use for everything, and `ONBOARDING-PROMPT.md`, the paste-ready
   prompt that onboards a new Muse.
@@ -94,8 +95,10 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
   Only items a person specifically asks to keep private stay off.
   Credentials, account numbers, and passwords never ride the relay.
 - **Files** go through the file server (`share_file` in the client).
-  Plain PUT creates only; corrections use `?replace=1`. `_talk/`
-  notes are append-only: never edit or delete one, add a new note.
+  Plain PUT creates only; corrections use `?replace=1`. Files can also
+  be deleted (to a `.deleted/` trash), renamed or moved, and folders
+  created. `_talk/` notes are append-only: never edit, delete, or move
+  one, add a new note.
   Before working in a project folder, read its `_talk/` notes
   (newest first) and its STATUS.md.
 - **Corrections go both ways.** Either Muse can correct the other by
@@ -113,8 +116,9 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
   verbatim memory filing, about tags, DM delivery, append-only talk
   notes, the replace route, and what never travels on the relay.
 - The servers already handle the failure modes: resumable uploads for
-  slow links, atomic replaces with a backup kept, log rotation, and
-  pruning of old backups, so the host PC does not fill up over time.
+  slow links, atomic replaces with a backup kept, safe deletes to a
+  trash folder, rename/move, log rotation, and pruning of old backups
+  and trash, so the host PC does not fill up over time.
 
 ## Troubleshooting
 
@@ -135,5 +139,5 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
 
 ## Version
 
-Kit v1.0 (2026-11-05). Relay v3, file server v4, client v1.
+Kit v1.0 (2026-11-05). Relay v3, file server v5, client v1.
 Standard library Python only, no dependencies. MIT licensed.

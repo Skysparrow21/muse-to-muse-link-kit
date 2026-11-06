@@ -1,43 +1,33 @@
 #!/usr/bin/env python3
-"""muse-files: tiny tailnet-only HTTP file server for the shared Muse projects.
+"""muse-files v5.0 - tailnet-only HTTP file server for the Muse-to-Muse share.
 
-Serves the shared project tree over HTTP so both Muses can read and write
-project files. FTP port 21 does not work for either Muse (their egress
-proxies do not carry it), so this HTTP server is the only path for both.
+Serves one root folder over plain HTTP. No auth: the tailnet is the boundary.
+Only ever bind a local address (loopback or a tailnet IP), never 0.0.0.0.
 
-Standard library only. No auth: the tailnet is the boundary, same as the
-relay. Binds to the host PC's tailnet IP only and refuses any other address
-except loopback test mode (--bind 127.0.0.1).
+Endpoints (all paths relative to the root):
+  GET  /dir/                 directory listing (HTML, or JSON with ?format=json)
+  GET  /dir/?format=zip      whole-folder zip download (max 2 GB total)
+  GET  /file                 streamed download (Range supported)
+  PUT  /file                 create only (409 if it exists)
+  PUT  /file?replace=1       replace (atomic; old version kept under .replaced/)
+  PUT  /file  + Content-Range  resumable chunked upload (see README)
+  DELETE /file               move to .deleted/ trash (pruned after 30 days)
+  MOVE /old?to=/new          rename / move a file (?replace=1 overwrites)
+  POST /dir/?mkdir=1         create a directory (parents too)
 
-Endpoints (all under the root):
-  GET  /path/        directory listing (HTML, or JSON with ?format=json)
-  GET  /path/file    download the file (streams, no size cap, Range resume supported)
-  GET  /path/?format=zip   download a whole folder as a zip (max 2 GB total, Range resume supported)
-  PUT  /path/file    create a new file (409 if it already exists; never overwrites)
-  PUT  /path/file?replace=1   replace an existing file (or create it if missing)
-Uploads stream to disk (max 1 GB per file).
-Resumable uploads: PUT with a Content-Range header (bytes start-end/total)
-sends one chunk; the server appends it to a .part file and acks how much it
-has. A dropped upload resumes by re-sending from the acked offset, so a
-big file can finish across drops on a slow link. The final chunk moves the
-file into place atomically.
-Replacements are atomic (temp file + rename) and the previous version is
-kept under .replaced/ (latest only, hidden from listings and zips).
-_talk/ notes are append-only: replace is refused for them (403).
-The log rotates at 10 MB (keeps one old copy). Backups under .replaced/
-older than 30 days and stale upload parts older than 7 days are pruned.
-No DELETE. Nothing outside the root is reachable.
-Logs tracebacks and a 5-minute heartbeat to the log file, so a silent death leaves evidence.
+Rules:
+  _talk/ folders are append-only: no replace, no delete, no move in or out.
+  .replaced/ and .deleted/ are hidden from listings and zips; a GET on the
+  exact path still downloads the file (recovery). They are pruned after
+  30 days. Stale .part / .tmp files are pruned after 7 days.
 """
-
 import argparse
 import html
 import json
 import mimetypes
 import os
-import shutil
+import re
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -48,261 +38,287 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, parse_qs
 
-MAX_BYTES = 1024 * 1024 * 1024
-ZIP_MAX_BYTES = 2 * 1024 * 1024 * 1024
-LOG_MAX_BYTES = 10 * 1024 * 1024
+VERSION = "5.0"
+PUT_MAX = 1024 * 1024 * 1024          # 1 GB per file
+ZIP_MAX = 2 * 1024 * 1024 * 1024      # 2 GB per folder zip
+CHUNK = 64 * 1024                     # 64 KB stream chunks
+LOG_ROTATE_BYTES = 10 * 1024 * 1024   # 10 MB, one old copy
 REPLACED_KEEP_DAYS = 30
+DELETED_KEEP_DAYS = 30
 PART_KEEP_DAYS = 7
-CHUNK = 65536
+HEARTBEAT_SECS = 300
 
-ROOT = None
-LOG_PATH = None
-_log_lock = threading.Lock()
+ROOT = None        # Path, set in main() before anything else runs
+LOG_PATH = None    # Path, set in main() before anything else runs
 
 
-def rotate_log():
-    """Rotate the log file at LOG_MAX_BYTES, keeping one old copy."""
-    if LOG_PATH is None:
-        return
+def log(msg):
+    """Write one line to stdout and to the log file. Never raise."""
     try:
-        if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
-            bak = LOG_PATH + ".1"
-            try:
-                os.unlink(bak)
-            except OSError:
-                pass
-            os.replace(LOG_PATH, bak)
-    except OSError:
-        pass
-
-
-def log(line):
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    text = "%s %s\n" % (stamp, line)
-    with _log_lock:
-        try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-        except Exception:
-            pass
+        line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+        print(line, flush=True)
         if LOG_PATH is not None:
             try:
-                rotate_log()
+                if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_ROTATE_BYTES:
+                    old = Path(str(LOG_PATH) + ".1")
+                    try:
+                        if old.exists():
+                            old.unlink()
+                    except OSError:
+                        pass
+                    try:
+                        LOG_PATH.rename(old)
+                    except OSError:
+                        pass
                 with open(LOG_PATH, "a", encoding="utf-8") as f:
-                    f.write(text)
-            except Exception:
+                    f.write(line + "\n")
+            except OSError:
                 pass
-
-
-def prune_old_files():
-    """Delete .replaced/ backups older than REPLACED_KEEP_DAYS and stale
-    upload temp files older than PART_KEEP_DAYS. Called at startup and on
-    each replace."""
-    if ROOT is None:
-        return
-    now = time.time()
-    try:
-        for dirpath, dirnames, filenames in os.walk(ROOT):
-            rel_dir = Path(dirpath).relative_to(ROOT)
-            in_replaced = bool(rel_dir.parts) and rel_dir.parts[0] == ".replaced"
-            for name in filenames:
-                fp = Path(dirpath) / name
-                try:
-                    age = now - fp.stat().st_mtime
-                except OSError:
-                    continue
-                try:
-                    if in_replaced and age > REPLACED_KEEP_DAYS * 86400:
-                        fp.unlink()
-                    elif name.startswith(".upload-") and age > PART_KEEP_DAYS * 86400:
-                        fp.unlink()
-                except OSError:
-                    pass
-        # Drop empty folders left under .replaced/ (deepest first).
-        base = ROOT / ".replaced"
-        if base.is_dir():
-            for dirpath, dirnames, filenames in os.walk(base, topdown=False):
-                if Path(dirpath) == base:
-                    continue
-                try:
-                    Path(dirpath).rmdir()
-                except OSError:
-                    pass
-    except OSError:
-        pass
-
-
-def detect_tailnet_ip():
-    try:
-        out = subprocess.check_output(
-            ["tailscale", "ip", "-4"], text=True, timeout=15
-        ).strip()
     except Exception:
-        return None
-    for line in out.splitlines():
-        ip = line.strip()
-        if ip.startswith("100."):
-            return ip
-    return None
-
-
-def local_ips():
-    ips = set()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            ips.add(info[4][0])
-    except socket.gaierror:
         pass
-    return ips
 
 
-def resolve(rel):
-    """Resolve a URL-relative path inside ROOT. Return a Path or None."""
-    rel = rel.lstrip("/\\")
-    target = (ROOT / rel).resolve()
-    if target == ROOT or ROOT in target.parents:
-        return target
-    return None
+def _prune_dir_tree(base, keep_days):
+    """Delete files under base older than keep_days; remove empty dirs."""
+    if not base.is_dir():
+        return 0
+    cutoff = time.time() - keep_days * 86400
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(base, topdown=False):
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        for name in dirnames:
+            d = Path(dirpath) / name
+            try:
+                d.rmdir()  # only succeeds if empty
+            except OSError:
+                pass
+    return removed
 
 
-def is_talk_path(rel):
-    """True if any segment of the relative path is a _talk folder."""
-    parts = [p for p in rel.replace("\\", "/").split("/") if p]
-    return any(p.lower() == "_talk" for p in parts)
+def prune():
+    """Prune old backups, trash, and stale partial uploads. Never raise."""
+    try:
+        n = 0
+        if ROOT is not None:
+            n += _prune_dir_tree(ROOT / ".replaced", REPLACED_KEEP_DAYS)
+            n += _prune_dir_tree(ROOT / ".deleted", DELETED_KEEP_DAYS)
+            cutoff = time.time() - PART_KEEP_DAYS * 86400
+            for dirpath, dirnames, filenames in os.walk(ROOT, topdown=True):
+                dirnames[:] = [d for d in dirnames if d not in (".replaced", ".deleted")]
+                for name in filenames:
+                    if name.startswith(".") and (name.endswith(".part") or name.endswith(".tmp")):
+                        p = Path(dirpath) / name
+                        try:
+                            if p.stat().st_mtime < cutoff:
+                                p.unlink()
+                                n += 1
+                        except OSError:
+                            pass
+        if n:
+            log("prune: removed %d old file(s)" % n)
+    except Exception:
+        pass
+
+
+def _resolve(url_path):
+    """Map a URL path to (absolute Path, rel posix string). Raises ValueError."""
+    raw = unquote(urlsplit(url_path).path)
+    rel = raw.lstrip("/")
+    abs_path = (ROOT / rel).resolve()
+    if abs_path != ROOT and ROOT not in abs_path.parents:
+        raise ValueError("outside root")
+    if abs_path == ROOT:
+        return abs_path, ""
+    return abs_path, abs_path.relative_to(ROOT).as_posix()
+
+
+def _is_talk(rel_posix):
+    return "_talk" in Path(rel_posix).parts if rel_posix else False
+
+
+def _is_reserved(rel_posix):
+    if not rel_posix:
+        return False
+    parts = Path(rel_posix).parts
+    if ".replaced" in parts or ".deleted" in parts:
+        return True
+    last = parts[-1]
+    return last.startswith(".") and (last.endswith(".part") or last.endswith(".tmp"))
+
+
+def _backup_to_replaced(abs_path, rel_posix):
+    dest = ROOT / ".replaced" / rel_posix
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    os.replace(abs_path, dest)
+
+
+def _trash_to_deleted(abs_path, rel_posix):
+    dest = ROOT / ".deleted" / rel_posix
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    os.replace(abs_path, dest)
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    server_version = "muse-files/" + VERSION
 
-    def log_message(self, fmt, *args):
-        log("%s - %s" % (self.address_string(), fmt % args))
+    def version_string(self):
+        return "muse-files/" + VERSION
 
-    def handle_error(self, request, client_address):
-        log("handler error from %s:\n%s" % (client_address, traceback.format_exc()))
-
-    def send_bytes(self, status, body, ctype="text/plain; charset=utf-8"):
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
+    # -- response helpers -------------------------------------------------
+    def _send_text(self, code, text):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        parts = urlsplit(self.path)
-        rel = unquote(parts.path).lstrip("/")
-        query = parse_qs(parts.query)
-        target = resolve(rel)
-        if target is None:
-            self.send_bytes(400, "bad path\n")
-            return
-        if target.is_dir():
-            self.list_dir(target, parts.path, query)
-        elif target.is_file():
-            self.send_file(target)
-        else:
-            self.send_bytes(404, "not found\n")
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    def list_dir(self, target, url_path, query):
+    # -- listings and downloads -------------------------------------------
+    def _list_dir(self, abs_dir, rel_posix, as_json):
         try:
-            entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            entries = []
+            with os.scandir(abs_dir) as it:
+                for e in it:
+                    name = e.name
+                    if name in (".replaced", ".deleted"):
+                        continue
+                    if name.startswith(".") and (name.endswith(".part") or name.endswith(".tmp")):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        entries.append({"name": name, "size": 0, "type": "dir"})
+                    else:
+                        entries.append({"name": name, "size": e.stat().st_size, "type": "file"})
         except OSError:
-            self.send_bytes(500, "cannot list\n")
+            self._send_text(500, "cannot list directory")
             return
-        # Hide the replace-backup folder and in-progress upload temp files.
-        entries = [e for e in entries
-                   if e.name != ".replaced" and not e.name.startswith(".upload-")]
-        if query.get("format") == ["zip"]:
-            self.send_zip(target, url_path)
+        entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+        if as_json:
+            self._send_json(200, {"version": VERSION, "path": rel_posix, "entries": entries})
             return
-        if query.get("format") == ["json"]:
-            items = []
-            for e in entries:
-                items.append({
-                    "name": e.name,
-                    "type": "dir" if e.is_dir() else "file",
-                    "size": e.stat().st_size if e.is_file() else 0,
-                })
-            body = json.dumps({"path": url_path, "entries": items}, indent=2)
-            self.send_bytes(200, body, "application/json")
-            return
-        rows = []
-        if url_path not in ("", "/"):
-            parent = url_path.rstrip("/").rsplit("/", 1)[0] + "/"
-            rows.append('<p><a href="%s">.. up</a></p>' % html.escape(parent))
-        rows.append("<ul>")
+        lines = []
+        lines.append("<!doctype html><html><head><meta charset='utf-8'>")
+        lines.append("<title>muse-files %s</title></head><body>" % html.escape(rel_posix or "/"))
+        lines.append("<h1>%s</h1><ul>" % html.escape("/" + rel_posix if rel_posix else "/"))
+        if rel_posix:
+            parent = "/".join(rel_posix.split("/")[:-1])
+            lines.append('<li><a href="/%s">../</a></li>' % quote(parent + "/" if parent else ""))
         for e in entries:
-            name = e.name + ("/" if e.is_dir() else "")
-            href = quote(url_path.rstrip("/") + "/" + e.name) + ("/" if e.is_dir() else "")
-            rows.append('<li><a href="%s">%s</a></li>' % (html.escape(href), html.escape(name)))
-        rows.append("</ul>")
-        page = "<html><head><title>muse-files %s</title></head><body><h1>%s</h1>%s</body></html>" % (
-            html.escape(url_path), html.escape(url_path), "".join(rows))
-        self.send_bytes(200, page, "text/html; charset=utf-8")
+            href = "/" + quote(rel_posix + "/" + e["name"]) if rel_posix else "/" + quote(e["name"])
+            if e["type"] == "dir":
+                href += "/"
+            lines.append('<li><a href="%s">%s</a></li>' % (href, html.escape(e["name"] + ("/" if e["type"] == "dir" else ""))))
+        lines.append("</ul><hr><p>muse-files v%s</p></body></html>" % VERSION)
+        body = "\n".join(lines).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    def send_zip(self, target, url_path):
+    def _serve_file(self, abs_path):
+        try:
+            size = abs_path.stat().st_size
+        except OSError:
+            self._send_text(404, "not found")
+            return
+        ctype, _enc = mimetypes.guess_type(str(abs_path))
+        if not ctype:
+            ctype = "application/octet-stream"
+        start, end = 0, size - 1
+        status = 200
+        range_hdr = self.headers.get("Range")
+        if range_hdr:
+            m = re.match(r"bytes=(\d*)-(\d*)$", range_hdr.strip())
+            if m:
+                a, b = m.group(1), m.group(2)
+                if a == "" and b == "":
+                    pass  # malformed, ignore -> full file
+                elif a == "":
+                    n = int(b)
+                    start = max(0, size - n)
+                    end = size - 1
+                    status = 206
+                else:
+                    start = int(a)
+                    end = int(b) if b != "" else size - 1
+                    status = 206
+                if status == 206:
+                    if start >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", "bytes */%d" % size)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if end >= size:
+                        end = size - 1
+                    if end < start:
+                        self.send_response(416)
+                        self.send_header("Content-Range", "bytes */%d" % size)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        with open(abs_path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                self.wfile.write(data)
+                remaining -= len(data)
+
+    def _zip_dir(self, abs_dir, rel_posix):
         files = []
         total = 0
-        for dirpath, dirnames, filenames in os.walk(target):
-            dirnames[:] = [d for d in dirnames if d != ".replaced"]
-            dirnames.sort()
-            for name in sorted(filenames):
-                if name.startswith(".upload-"):
+        for dirpath, dirnames, filenames in os.walk(abs_dir):
+            dirnames[:] = [d for d in dirnames if d not in (".replaced", ".deleted")]
+            for name in filenames:
+                if name.startswith(".") and (name.endswith(".part") or name.endswith(".tmp")):
                     continue
-                fp = Path(dirpath) / name
+                p = Path(dirpath) / name
                 try:
-                    total += fp.stat().st_size
+                    sz = p.stat().st_size
                 except OSError:
                     continue
-                if total > ZIP_MAX_BYTES:
-                    self.send_bytes(413, "folder too large to zip\n")
+                total += sz
+                if total > ZIP_MAX:
+                    self._send_text(413, "folder too large for zip")
                     return
-                files.append(fp)
-        name = (target.name or "files") + ".zip"
+                files.append((p, p.relative_to(abs_dir).as_posix()))
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(suffix=".zip")
             os.close(fd)
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                for fp in files:
-                    zf.write(fp, fp.relative_to(target).as_posix())
-            size = os.path.getsize(tmp)
-            start = 0
-            end = size - 1
-            status = 200
-            range_header = self.headers.get("Range")
-            if range_header:
-                parsed = self.parse_range(range_header, size)
-                if parsed == "unsat":
-                    self.send_response(416)
-                    self.send_header("Content-Range", "bytes */%d" % size)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                if parsed != "ignore":
-                    start, end = parsed
-                    status = 206
-            length = end - start + 1
-            self.send_response(status)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
-            self.send_header("Content-Length", str(length))
-            if status == 206:
-                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-            with open(tmp, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(CHUNK, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except OSError:
-            self.send_bytes(500, "cannot zip\n")
+                for p, arc in files:
+                    zf.write(p, arc)
+            self._serve_file(Path(tmp))
         finally:
             if tmp:
                 try:
@@ -310,307 +326,364 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
-    def send_file(self, target):
-        ctype, _ = mimetypes.guess_type(str(target))
-        if ctype is None:
-            ctype = "application/octet-stream"
+    # -- GET ---------------------------------------------------------------
+    def do_GET(self):
         try:
-            size = target.stat().st_size
-            start = 0
-            end = size - 1
-            status = 200
-            range_header = self.headers.get("Range")
-            if range_header:
-                parsed = self.parse_range(range_header, size)
-                if parsed == "unsat":
-                    self.send_response(416)
-                    self.send_header("Content-Range", "bytes */%d" % size)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                if parsed != "ignore":
-                    start, end = parsed
-                    status = 206
-            length = end - start + 1
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(length))
-            if status == 206:
-                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
-            with open(target, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(CHUNK, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except OSError:
-            self.send_bytes(500, "cannot read\n")
-
-    def parse_range(self, header, size):
-        # Supports "bytes=start-", "bytes=start-end", "bytes=-suffix".
-        # Returns (start, end), "ignore" (malformed, serve whole file),
-        # or "unsat" (range starts past the end of the file).
-        if not header.startswith("bytes="):
-            return "ignore"
-        spec = header[len("bytes="):].strip()
-        if "," in spec:
-            return "ignore"
-        if spec.startswith("-"):
-            try:
-                suffix = int(spec[1:])
-            except ValueError:
-                return "ignore"
-            if suffix <= 0:
-                return "ignore"
-            return (max(0, size - suffix), size - 1)
-        parts = spec.split("-")
-        if len(parts) != 2:
-            return "ignore"
-        try:
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else size - 1
+            abs_path, rel = _resolve(self.path)
         except ValueError:
-            return "ignore"
-        if start < 0:
-            return "ignore"
-        if start >= size:
-            return "unsat"
-        if end < start:
-            return "ignore"
-        return (start, min(end, size - 1))
+            self._send_text(400, "bad path")
+            return
+        qs = parse_qs(urlsplit(self.path).query)
+        if _is_reserved(rel):
+            # exact .replaced/ or .deleted/ file: allow download (recovery)
+            parts = Path(rel).parts if rel else ()
+            if (".replaced" in parts or ".deleted" in parts) and abs_path.is_file():
+                self._serve_file(abs_path)
+            else:
+                self._send_text(404, "not found")
+            return
+        if not abs_path.exists():
+            self._send_text(404, "not found")
+            return
+        if abs_path.is_dir():
+            if qs.get("format") == ["zip"]:
+                self._zip_dir(abs_path, rel)
+            else:
+                self._list_dir(abs_path, rel, qs.get("format") == ["json"])
+            return
+        self._serve_file(abs_path)
 
-    def backup(self, target, rel):
-        """Keep the previous version under .replaced/ (latest only)."""
-        try:
-            dest = (ROOT / ".replaced" / rel).resolve()
-            if dest == ROOT or ROOT not in dest.parents:
-                return
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, dest)
-        except OSError:
-            log("backup failed for %s" % rel)
-        prune_old_files()
-
-    def part_path(self, target):
-        """Resume file for a chunked upload of target."""
-        return target.parent / (".upload-" + target.name + ".part")
-
-    def parse_content_range(self, header):
-        """Parse 'bytes start-end/total'. Returns (start, end, total)."""
-        if not header.startswith("bytes "):
-            raise ValueError("bad range")
-        spec = header[len("bytes "):].strip()
-        if "/" not in spec:
-            raise ValueError("bad range")
-        span, total = spec.split("/", 1)
-        if "-" not in span:
-            raise ValueError("bad range")
-        a, b = span.split("-", 1)
-        start = int(a)
-        end = int(b)
-        total = int(total)
-        if start < 0 or end < start or end >= total or total <= 0:
-            raise ValueError("bad range")
-        return start, end, total
+    # -- PUT ---------------------------------------------------------------
+    def _read_exact(self, n):
+        """Read exactly n bytes from the request body (or fewer on EOF)."""
+        buf = bytearray()
+        while len(buf) < n:
+            data = self.rfile.read(min(CHUNK, n - len(buf)))
+            if not data:
+                break
+            buf.extend(data)
+        return bytes(buf)
 
     def do_PUT(self):
-        parts = urlsplit(self.path)
-        rel = unquote(parts.path).lstrip("/")
-        query = parse_qs(parts.query)
-        replace = query.get("replace") == ["1"]
-        target = resolve(rel)
-        if target is None:
-            self.send_bytes(400, "bad path\n")
-            return
-        length = self.headers.get("Content-Length")
-        if length is None:
-            self.send_bytes(411, "length required\n")
-            return
         try:
-            nbytes = int(length)
+            abs_path, rel = _resolve(self.path)
         except ValueError:
-            self.send_bytes(400, "bad length\n")
+            self._send_text(400, "bad path")
             return
-        if nbytes < 0 or nbytes > MAX_BYTES:
-            self.send_bytes(413, "too large\n")
+        if _is_reserved(rel):
+            self._send_text(403, "reserved path")
             return
-        range_header = self.headers.get("Content-Range")
-        chunked = None
-        if range_header:
-            try:
-                chunked = self.parse_content_range(range_header)
-            except ValueError:
-                self.send_bytes(400, "bad content-range\n")
-                return
-            start, end, total = chunked
-            if total > MAX_BYTES:
-                self.send_bytes(413, "too large\n")
-                return
-            if nbytes != end - start + 1:
-                self.send_bytes(400, "length does not match range\n")
-                return
-        if target.is_dir():
-            self.send_bytes(409, "already exists\n")
+        if abs_path.is_dir() or urlsplit(self.path).path.endswith("/"):
+            self._send_text(400, "cannot PUT a directory")
             return
-        exists = target.exists()
-        if exists and not replace:
-            self.send_bytes(409, "already exists\n")
-            return
-        if exists and replace and is_talk_path(rel):
-            self.send_bytes(403, "talk notes are append-only\n")
+        length_hdr = self.headers.get("Content-Length")
+        if length_hdr is None:
+            self._send_text(411, "length required")
             return
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if chunked is not None:
-                self.put_chunked(target, rel, chunked, exists, replace)
-                return
-            fd, tmp = tempfile.mkstemp(prefix=".upload-", dir=str(target.parent))
-            try:
-                remaining = nbytes
-                with os.fdopen(fd, "wb") as f:
-                    while remaining > 0:
-                        chunk = self.rfile.read(min(CHUNK, remaining))
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        remaining -= len(chunk)
+            length = int(length_hdr)
+        except ValueError:
+            self._send_text(400, "bad content-length")
+            return
+        if length < 0:
+            self._send_text(400, "bad content-length")
+            return
+        qs = parse_qs(urlsplit(self.path).query)
+        replace = qs.get("replace") == ["1"]
+        range_hdr = self.headers.get("Content-Range")
+        if range_hdr:
+            self._put_chunked(abs_path, rel, length, replace, range_hdr)
+        else:
+            self._put_regular(abs_path, rel, length, replace)
+
+    def _put_regular(self, abs_path, rel, length, replace):
+        if length > PUT_MAX:
+            self._send_text(413, "file too large")
+            return
+        exists = abs_path.exists()
+        if exists and not replace:
+            self._send_text(409, "already exists (use ?replace=1)")
+            return
+        if exists and replace and _is_talk(rel):
+            self._send_text(403, "_talk/ is append-only")
+            return
+        if exists and abs_path.is_dir():
+            self._send_text(400, "cannot PUT a directory")
+            return
+        parent = abs_path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._send_text(500, "cannot create directory")
+            return
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(parent), prefix="." + abs_path.name + ".", suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    data = self.rfile.read(min(CHUNK, remaining))
+                    if not data:
+                        break
+                    f.write(data)
+                    remaining -= len(data)
                 if remaining > 0:
-                    os.unlink(tmp)
-                    self.send_bytes(400, "short upload\n")
-                    return
-                if exists:
-                    self.backup(target, rel)
-                os.replace(tmp, target)
-            except OSError:
+                    raise IOError("short upload")
+            if exists:
+                _backup_to_replaced(abs_path, rel)
+            os.replace(tmp, abs_path)
+            tmp = None
+            prune()
+            self._send_text(200 if exists else 201, "ok")
+        except (OSError, IOError):
+            if tmp:
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
-                raise
-        except OSError:
-            self.send_bytes(500, "cannot write\n")
-            return
-        verb = "replaced" if exists else "created"
-        log("%s %s" % (verb, rel))
-        self.send_bytes(200 if exists else 201, "%s %s\n" % (verb, rel))
+            self._send_text(400, "upload failed")
 
-    def put_chunked(self, target, rel, chunked, exists, replace):
-        """One chunk of a resumable upload. Chunks arrive in order; the
-        server appends to a .part file and acks how much it has. The final
-        chunk moves the file into place atomically."""
-        start, end, total = chunked
-        part = self.part_path(target)
+    def _put_chunked(self, abs_path, rel, length, replace, range_hdr):
+        m = re.match(r"bytes (\d+)-(\d+)/(\d+)$", range_hdr.strip())
+        if not m:
+            self._send_text(400, "bad content-range")
+            return
+        start, end, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if total > PUT_MAX:
+            self._send_text(413, "file too large")
+            return
+        if total <= 0 or start < 0 or end < start or end >= total:
+            self._send_text(400, "bad content-range")
+            return
+        if length != end - start + 1:
+            self._send_text(400, "content-length does not match content-range")
+            return
+        exists = abs_path.exists()
         if start == 0:
+            if exists and not replace:
+                self._send_text(409, "already exists (use ?replace=1)")
+                return
+            if exists and replace and _is_talk(rel):
+                self._send_text(403, "_talk/ is append-only")
+                return
+        part = abs_path.parent / ("." + abs_path.name + ".part")
+        if start == 0:
+            try:
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self._send_text(500, "cannot create directory")
+                return
+            mode = "wb"
+        else:
+            if not part.exists() or part.stat().st_size != start:
+                self._send_text(409, "wrong offset, restart from zero")
+                return
+            mode = "ab"
+        try:
+            data = self._read_exact(length)
+        except OSError:
+            self._send_text(400, "upload failed")
+            return
+        if len(data) != length:
+            self._send_text(400, "short upload")
+            return
+        try:
+            with open(part, mode) as f:
+                f.write(data)
+            received = part.stat().st_size
+        except OSError:
+            self._send_text(500, "cannot write part")
+            return
+        if received < total:
+            self._send_text(200, "received %d/%d" % (received, total))
+            return
+        if received > total:
             try:
                 part.unlink()
             except OSError:
                 pass
-        else:
-            try:
-                if part.stat().st_size != start:
-                    self.send_bytes(409, "offset mismatch, restart upload\n")
-                    return
-            except OSError:
-                self.send_bytes(409, "offset mismatch, restart upload\n")
-                return
-        try:
-            remaining = end - start + 1
-            with open(part, "ab") as f:
-                while remaining > 0:
-                    chunk = self.rfile.read(min(CHUNK, remaining))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-            if remaining > 0:
-                try:
-                    os.truncate(part, start)
-                except OSError:
-                    pass
-                self.send_bytes(400, "short upload\n")
-                return
-            received = part.stat().st_size
-            if received != end + 1:
-                self.send_bytes(400, "short upload\n")
-                return
-            if end < total - 1:
-                self.send_bytes(200, "received %d/%d\n" % (received, total))
-                return
-            if exists:
-                self.backup(target, rel)
-            os.replace(part, target)
-        except OSError:
-            self.send_bytes(500, "cannot write\n")
+            self._send_text(400, "too much data")
             return
-        verb = "replaced" if exists else "created"
-        log("%s %s (chunked)" % (verb, rel))
-        self.send_bytes(200 if exists else 201, "%s %s\n" % (verb, rel))
+        try:
+            if exists:
+                _backup_to_replaced(abs_path, rel)
+            os.replace(part, abs_path)
+        except OSError:
+            self._send_text(500, "cannot finish upload")
+            return
+        prune()
+        self._send_text(200 if exists else 201, "ok")
 
+    # -- DELETE ------------------------------------------------------------
     def do_DELETE(self):
-        self.send_bytes(405, "no delete\n")
+        try:
+            abs_path, rel = _resolve(self.path)
+        except ValueError:
+            self._send_text(400, "bad path")
+            return
+        if _is_reserved(rel):
+            self._send_text(403, "reserved path")
+            return
+        if _is_talk(rel):
+            self._send_text(403, "_talk/ is append-only")
+            return
+        if not abs_path.exists():
+            self._send_text(404, "not found")
+            return
+        if abs_path.is_dir():
+            self._send_text(400, "cannot delete a directory")
+            return
+        try:
+            _trash_to_deleted(abs_path, rel)
+        except OSError:
+            self._send_text(500, "cannot delete")
+            return
+        prune()
+        self._send_text(200, "deleted %s (moved to .deleted/%s)" % (rel, rel))
 
+    # -- MOVE --------------------------------------------------------------
+    def do_MOVE(self):
+        try:
+            abs_path, rel = _resolve(self.path)
+        except ValueError:
+            self._send_text(400, "bad path")
+            return
+        qs = parse_qs(urlsplit(self.path).query)
+        dest_raw = None
+        if qs.get("to"):
+            dest_raw = qs["to"][0]
+        elif self.headers.get("Destination"):
+            dest_raw = self.headers.get("Destination")
+            if "://" in dest_raw:
+                dest_raw = urlsplit(dest_raw).path
+        if not dest_raw:
+            self._send_text(400, "missing ?to= destination")
+            return
+        try:
+            dest_abs, dest_rel = _resolve(dest_raw)
+        except ValueError:
+            self._send_text(400, "bad destination")
+            return
+        if _is_reserved(rel) or _is_reserved(dest_rel):
+            self._send_text(403, "reserved path")
+            return
+        if _is_talk(rel) or _is_talk(dest_rel):
+            self._send_text(403, "_talk/ is append-only")
+            return
+        if not abs_path.exists():
+            self._send_text(404, "not found")
+            return
+        if abs_path.is_dir():
+            self._send_text(400, "cannot move a directory")
+            return
+        replace = qs.get("replace") == ["1"]
+        dest_exists = dest_abs.exists()
+        if dest_exists and not replace:
+            self._send_text(409, "destination exists (use ?replace=1)")
+            return
+        if dest_exists and dest_abs.is_dir():
+            self._send_text(400, "destination is a directory")
+            return
+        try:
+            dest_abs.parent.mkdir(parents=True, exist_ok=True)
+            if dest_exists:
+                _backup_to_replaced(dest_abs, dest_rel)
+            os.replace(abs_path, dest_abs)
+        except OSError:
+            self._send_text(500, "cannot move")
+            return
+        prune()
+        self._send_text(200, "moved %s -> %s" % (rel, dest_rel))
+
+    # -- POST --------------------------------------------------------------
     def do_POST(self):
-        self.send_bytes(405, "use PUT\n")
+        try:
+            abs_path, rel = _resolve(self.path)
+        except ValueError:
+            self._send_text(400, "bad path")
+            return
+        qs = parse_qs(urlsplit(self.path).query)
+        if qs.get("mkdir") != ["1"]:
+            self._send_text(405, "use PUT for files, POST ?mkdir=1 for directories")
+            return
+        if _is_reserved(rel):
+            self._send_text(403, "reserved path")
+            return
+        if abs_path.exists() and abs_path.is_file():
+            self._send_text(409, "a file exists at that path")
+            return
+        if abs_path.exists() and abs_path.is_dir():
+            self._send_text(200, "already exists")
+            return
+        try:
+            abs_path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._send_text(500, "cannot create directory")
+            return
+        self._send_text(201, "created %s" % rel)
+
+    # -- error handling ----------------------------------------------------
+    def handle_error(self, request, client_address):
+        log("error handling %s from %s:\n%s" % (getattr(self, "requestline", "?"), client_address, traceback.format_exc()))
+
+    def log_message(self, format, *args):
+        log(format % args)
 
 
-def main():
-    global ROOT, LOG_PATH
-    ap = argparse.ArgumentParser(description="muse-files HTTP server")
-    ap.add_argument("--bind", default=None,
-                    help="tailnet IP to bind (default: auto-detect via tailscale)")
-    ap.add_argument("--port", type=int, default=8788, help="port (default 8788)")
-    ap.add_argument("--root", default=r"C:\muse-relay\data\ftp", help="folder to serve")
-    ap.add_argument("--log", default=r"C:\muse-relay\muse_files.log", help="log file")
-    args = ap.parse_args()
+def _heartbeat():
+    while True:
+        time.sleep(HEARTBEAT_SECS)
+        log("alive (pid %d)" % os.getpid())
 
-    ROOT = Path(args.root).resolve()
-    LOG_PATH = args.log
-    ROOT.mkdir(parents=True, exist_ok=True)
-    prune_old_files()
 
-    if args.bind == "0.0.0.0":
-        log("refusing to bind 0.0.0.0: tailnet IP only")
-        return 2
-    bind = args.bind
-    if bind is None:
-        bind = detect_tailnet_ip()
-    if not bind:
-        log("could not detect a tailnet IP; pass --bind <tailnet-ip>")
-        return 2
-    if bind != "127.0.0.1" and bind not in local_ips():
-        log("bind IP %s is not one of this machine's addresses" % bind)
-        return 2
-
+def _is_local_ip(ip):
+    if ip in ("0.0.0.0", "::"):
+        return False
     try:
-        server = ThreadingHTTPServer((bind, args.port), Handler)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind((ip, 0))
+            return True
+        finally:
+            s.close()
     except OSError:
-        log("cannot bind http://%s:%d/:\n%s" % (bind, args.port, traceback.format_exc()))
+        return False
+
+
+def main(argv=None):
+    global ROOT, LOG_PATH
+    p = argparse.ArgumentParser(description="muse-files v%s - tailnet-only HTTP file server" % VERSION)
+    p.add_argument("--bind", default="100.69.224.71")
+    p.add_argument("--port", type=int, default=8788)
+    p.add_argument("--root", default=r"C:\muse-relay\data\ftp")
+    p.add_argument("--log", default=r"C:\muse-relay\muse_files.log")
+    args = p.parse_args(argv)
+    ROOT = Path(args.root).resolve()
+    LOG_PATH = Path(args.log)
+    try:
+        ip = socket.gethostbyname(args.bind)
+    except OSError:
+        log("cannot resolve bind address %s" % args.bind)
+        return 2
+    if not _is_local_ip(ip):
+        log("refusing to bind %s (not a local address)" % args.bind)
+        return 2
+    try:
+        server = ThreadingHTTPServer((ip, args.port), Handler)
+    except OSError as e:
+        log("cannot bind %s:%d: %s" % (ip, args.port, e))
         return 1
-    server.daemon_threads = True
-    log("muse-files up on http://%s:%d/ serving %s (pid %d)" % (bind, args.port, ROOT, os.getpid()))
-    stop = threading.Event()
-
-    def heartbeat():
-        while not stop.wait(300):
-            log("alive (pid %d)" % os.getpid())
-
-    threading.Thread(target=heartbeat, daemon=True).start()
+    log("muse-files v%s up on http://%s:%d/ serving %s (pid %d)" % (VERSION, args.bind, args.port, ROOT, os.getpid()))
+    prune()
+    t = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("muse-files stopping (keyboard interrupt)")
+        log("muse-files stopped")
     except BaseException:
-        log("muse-files FATAL:\n%s" % traceback.format_exc())
+        log("muse-files FATAL:\n" + traceback.format_exc())
         raise
-    finally:
-        stop.set()
-    server.server_close()
-    log("muse-files stopped")
     return 0
 
 

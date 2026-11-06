@@ -20,6 +20,11 @@ relay. Binds to the host PC's tailnet IP only (loopback test mode with
   uploads via Content-Range; Range resume on zip downloads; log rotation
   (10 MB, one old copy); automatic prune of old `.replaced/` backups
   (30 days) and stale upload parts (7 days).
+- v5 (2026-11-05): full file operations. DELETE moves a file to a
+  `.deleted/` trash (pruned after 30 days) instead of removing it for
+  good; MOVE renames a file or moves it to another folder; POST
+  `?mkdir=1` creates a directory. Empty (0-byte) files are allowed.
+  Server header reports the version.
 
 ## Endpoints (all under the root)
 
@@ -33,7 +38,14 @@ relay. Binds to the host PC's tailnet IP only (loopback test mode with
   missing). Replaces are atomic: the upload streams to a temp file first,
   then renames over the old one, so a failed upload never corrupts the
   file in place. Returns 200 on replace, 201 on create.
-- No DELETE. Nothing outside the root is reachable.
+- `DELETE /path/file` - remove a file by moving it to `.deleted/` trash
+  (mirrors the project path, pruned after 30 days). 200 on success.
+- `MOVE /old?to=/new` - rename a file or move it to another folder.
+  409 if the destination exists (`&replace=1` overwrites it, the old
+  destination goes to `.replaced/`). A `Destination:` header works too.
+- `POST /path/?mkdir=1` - create a directory (parents too). 201 on
+  create, 200 if it already exists.
+- Nothing outside the root is reachable.
 
 ## Resumable uploads (for slow links)
 
@@ -67,6 +79,21 @@ time the connection breaks.
   Corrections to a talk note go in a new note, as always.
 - Plain `PUT` without `?replace=1` still refuses to overwrite (409).
 
+## Delete, move, and mkdir
+
+- DELETE never removes a file for good on the spot: the file is moved to
+  `.deleted/` (mirrors the project path, latest version only). It is
+  hidden from listings and zips, but a GET on the exact `.deleted/...`
+  path still downloads it for recovery. Files older than 30 days are
+  pruned automatically.
+- MOVE renames or moves a file. It is atomic (one rename on the same
+  disk). Moving to an existing destination is refused with 409 unless
+  `?replace=1` is given, in which case the old destination is kept under
+  `.replaced/` first.
+- POST `?mkdir=1` creates a directory, including any missing parents.
+- `_talk/` notes are append-only for all three: DELETE, MOVE in or out,
+  and replace are all refused with 403 there. Add a new note instead.
+
 ## Install (on the host PC)
 
 1. Copy `muse_files.py` (and this README) into `C:\muse-relay\`.
@@ -81,8 +108,9 @@ time the connection breaks.
 - The server logs to `C:\muse-relay\muse_files.log`, with a 5-minute
   heartbeat, so a silent death leaves evidence. The log rotates at
   10 MB (one old copy kept).
-- Cleanup runs on startup and on every replace: `.replaced/` backups
-  older than 30 days and stale upload parts older than 7 days are deleted.
+- Cleanup runs on startup and after every change: `.replaced/` backups
+  and `.deleted/` trash older than 30 days and stale upload parts older
+  than 7 days are deleted.
 - `run_files.bat` runs the server in a window for testing (Ctrl+C stops).
 - The scheduled task's LastTaskResult 267009 means "currently running"
   (good for a long-running server). 112 means the launch failed.
