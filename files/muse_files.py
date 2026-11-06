@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""muse-files v5.0 - tailnet-only HTTP file server for the Muse-to-Muse share.
+"""muse-files v6.0 - tailnet-only HTTP file server for the Muse-to-Muse share.
 
 Serves one root folder over plain HTTP. No auth: the tailnet is the boundary.
 Only ever bind a local address (loopback or a tailnet IP), never 0.0.0.0.
@@ -14,9 +14,23 @@ Endpoints (all paths relative to the root):
   DELETE /file               move to .deleted/ trash (pruned after 30 days)
   MOVE /old?to=/new          rename / move a file (?replace=1 overwrites)
   POST /dir/?mkdir=1         create a directory (parents too)
+  POST /file?append=1        append one line to a file (atomic)
+
+v6 additions (Unified Workspace):
+  changes.json is server-maintained: every successful write (PUT, replace,
+  MOVE, DELETE, mkdir, append) appends an entry {ts, path, action, by} to
+  /changes.json. Clients read it, never write it directly. It is the
+  single sync index; each Muse polls it and GETs only what changed.
+  inbox.jsonl is the append-only message log (one line per message).
+  When a state.json file is created or replaced, the server regenerates
+  the matching STATUS.md from it (same directory).
 
 Rules:
-  _talk/ folders are append-only: no replace, no delete, no move in or out.
+  _talk/ folders are append-only: no replace, no delete, no move in or out,
+  and no append to an existing _talk/ note (add a new note instead).
+  changes.json and inbox.jsonl are system files: no PUT, no MOVE, no DELETE
+  on them. APPEND to changes.json is refused (server-only); APPEND to
+  inbox.jsonl is how messages are added. GET on both is allowed.
   .replaced/ and .deleted/ are hidden from listings and zips; a GET on the
   exact path still downloads the file (recovery). They are pruned after
   30 days. Stale .part / .tmp files are pruned after 7 days.
@@ -38,9 +52,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, parse_qs
 
-VERSION = "5.0"
+VERSION = "6.0"
 PUT_MAX = 1024 * 1024 * 1024          # 1 GB per file
 ZIP_MAX = 2 * 1024 * 1024 * 1024      # 2 GB per folder zip
+APPEND_MAX = 1024 * 1024              # 1 MB per append (one line)
 CHUNK = 64 * 1024                     # 64 KB stream chunks
 LOG_ROTATE_BYTES = 10 * 1024 * 1024   # 10 MB, one old copy
 REPLACED_KEEP_DAYS = 30
@@ -169,6 +184,169 @@ def _trash_to_deleted(abs_path, rel_posix):
     os.replace(abs_path, dest)
 
 
+CHANGES_LOCK = threading.Lock()
+APPEND_LOCK = threading.Lock()
+
+
+def _is_system(rel_posix):
+    """True for the server-maintained files at the root (changes.json, inbox.jsonl)."""
+    return rel_posix in ("changes.json", "inbox.jsonl")
+
+
+def _utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _log_change(path, action, by, extra=None):
+    """Append one entry to /changes.json (the sync index). Never raise.
+
+    Entry: {ts, path, action, by} plus any extra fields (e.g. "from" for MOVE).
+    changes.json itself is never logged (it is the log).
+    """
+    try:
+        entry = {"ts": _utc_now(), "path": path, "action": action, "by": by}
+        if extra:
+            entry.update(extra)
+        with CHANGES_LOCK:
+            f = ROOT / "changes.json"
+            entries = []
+            if f.exists():
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if isinstance(data, list):
+                        entries = data
+                except (OSError, ValueError):
+                    entries = []
+            entries.append(entry)
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(dir=str(ROOT), prefix=".changes.", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(entries, fh)
+                    fh.write("\n")
+                os.replace(tmp, f)
+                tmp = None
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+    except Exception:
+        try:
+            log("changes.json update failed:\n" + traceback.format_exc())
+        except Exception:
+            pass
+
+
+def _render_status(state):
+    """Render a state.json dict as a short human-readable STATUS.md."""
+    lines = []
+    project = state.get("project", "Project")
+    lines.append("# %s" % project)
+    lines.append("")
+    status = state.get("status")
+    if status:
+        lines.append("**Status:** %s" % status)
+        lines.append("")
+    summary = state.get("summary")
+    if summary:
+        lines.append(summary)
+        lines.append("")
+    last_updated = state.get("last_updated")
+    if last_updated:
+        lines.append("**Last updated:** %s" % last_updated)
+    last_change = state.get("last_change")
+    if isinstance(last_change, dict):
+        by = last_change.get("by", "")
+        at = last_change.get("at", "")
+        what = last_change.get("what", "")
+        parts = [p for p in (by, at) if p]
+        head = " ".join(parts)
+        if head and what:
+            lines.append("**Last change:** %s - %s" % (head, what))
+        elif what:
+            lines.append("**Last change:** %s" % what)
+        elif head:
+            lines.append("**Last change:** %s" % head)
+    if last_updated or isinstance(last_change, dict):
+        lines.append("")
+    open_items = state.get("open_items")
+    if isinstance(open_items, list) and open_items:
+        lines.append("## Open items")
+        lines.append("")
+        for item in open_items:
+            if isinstance(item, dict):
+                text = item.get("item", "")
+                st = item.get("status", "")
+                owner = item.get("owner", "")
+                bits = []
+                if st:
+                    bits.append(st)
+                if owner:
+                    bits.append("owner: %s" % owner)
+                suffix = " (%s)" % ", ".join(bits) if bits else ""
+                lines.append("- %s%s" % (text, suffix))
+            else:
+                lines.append("- %s" % item)
+        lines.append("")
+    key_facts = state.get("key_facts")
+    if isinstance(key_facts, dict) and key_facts:
+        lines.append("## Key facts")
+        lines.append("")
+        for k, v in key_facts.items():
+            lines.append("- %s: %s" % (k, v))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _maybe_generate_status(abs_path, rel_posix):
+    """If abs_path is a state.json, regenerate the matching STATUS.md.
+
+    Returns True if STATUS.md was written. Never raises.
+    """
+    try:
+        if Path(rel_posix).name != "state.json":
+            return False
+        try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, ValueError):
+            log("state.json %s is not valid JSON; STATUS.md left unchanged" % rel_posix)
+            return False
+        if not isinstance(state, dict):
+            log("state.json %s is not an object; STATUS.md left unchanged" % rel_posix)
+            return False
+        content = _render_status(state)
+        status_rel = str(Path(rel_posix).parent / "STATUS.md")
+        status_abs = ROOT / status_rel
+        tmp = None
+        try:
+            status_abs.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(status_abs.parent), prefix=".STATUS.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            if status_abs.exists():
+                _backup_to_replaced(status_abs, status_rel)
+            os.replace(tmp, status_abs)
+            tmp = None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        _log_change(status_rel, "generate", "server")
+        return True
+    except Exception:
+        try:
+            log("STATUS.md generation failed for %s:\n%s" % (rel_posix, traceback.format_exc()))
+        except Exception:
+            pass
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "muse-files/" + VERSION
 
@@ -191,6 +369,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _request_by(self, qs):
+        """Who is making this write: ?by= param, X-By header, or 'unknown'."""
+        if qs.get("by"):
+            return qs["by"][0]
+        hdr = self.headers.get("X-By")
+        if hdr:
+            return hdr
+        return "unknown"
 
     # -- listings and downloads -------------------------------------------
     def _list_dir(self, abs_dir, rel_posix, as_json):
@@ -373,6 +560,9 @@ class Handler(BaseHTTPRequestHandler):
         if _is_reserved(rel):
             self._send_text(403, "reserved path")
             return
+        if _is_system(rel):
+            self._send_text(403, "server-maintained file (use APPEND for inbox.jsonl)")
+            return
         if abs_path.is_dir() or urlsplit(self.path).path.endswith("/"):
             self._send_text(400, "cannot PUT a directory")
             return
@@ -389,14 +579,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(400, "bad content-length")
             return
         qs = parse_qs(urlsplit(self.path).query)
+        by = self._request_by(qs)
         replace = qs.get("replace") == ["1"]
         range_hdr = self.headers.get("Content-Range")
         if range_hdr:
-            self._put_chunked(abs_path, rel, length, replace, range_hdr)
+            self._put_chunked(abs_path, rel, length, replace, range_hdr, by)
         else:
-            self._put_regular(abs_path, rel, length, replace)
+            self._put_regular(abs_path, rel, length, replace, by)
 
-    def _put_regular(self, abs_path, rel, length, replace):
+    def _put_regular(self, abs_path, rel, length, replace, by):
         if length > PUT_MAX:
             self._send_text(413, "file too large")
             return
@@ -434,6 +625,8 @@ class Handler(BaseHTTPRequestHandler):
             os.replace(tmp, abs_path)
             tmp = None
             prune()
+            _log_change(rel, "replace" if exists else "put", by)
+            _maybe_generate_status(abs_path, rel)
             self._send_text(200 if exists else 201, "ok")
         except (OSError, IOError):
             if tmp:
@@ -443,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             self._send_text(400, "upload failed")
 
-    def _put_chunked(self, abs_path, rel, length, replace, range_hdr):
+    def _put_chunked(self, abs_path, rel, length, replace, range_hdr, by):
         m = re.match(r"bytes (\d+)-(\d+)/(\d+)$", range_hdr.strip())
         if not m:
             self._send_text(400, "bad content-range")
@@ -512,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(500, "cannot finish upload")
             return
         prune()
+        _log_change(rel, "replace" if exists else "put", by)
+        _maybe_generate_status(abs_path, rel)
         self._send_text(200 if exists else 201, "ok")
 
     # -- DELETE ------------------------------------------------------------
@@ -523,6 +718,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if _is_reserved(rel):
             self._send_text(403, "reserved path")
+            return
+        if _is_system(rel):
+            self._send_text(403, "server-maintained file")
             return
         if _is_talk(rel):
             self._send_text(403, "_talk/ is append-only")
@@ -539,6 +737,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(500, "cannot delete")
             return
         prune()
+        qs = parse_qs(urlsplit(self.path).query)
+        _log_change(rel, "delete", self._request_by(qs))
         self._send_text(200, "deleted %s (moved to .deleted/%s)" % (rel, rel))
 
     # -- MOVE --------------------------------------------------------------
@@ -567,6 +767,9 @@ class Handler(BaseHTTPRequestHandler):
         if _is_reserved(rel) or _is_reserved(dest_rel):
             self._send_text(403, "reserved path")
             return
+        if _is_system(rel) or _is_system(dest_rel):
+            self._send_text(403, "server-maintained file")
+            return
         if _is_talk(rel) or _is_talk(dest_rel):
             self._send_text(403, "_talk/ is append-only")
             return
@@ -593,6 +796,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(500, "cannot move")
             return
         prune()
+        _log_change(dest_rel, "move", self._request_by(qs), {"from": rel})
+        _maybe_generate_status(dest_abs, dest_rel)
         self._send_text(200, "moved %s -> %s" % (rel, dest_rel))
 
     # -- POST --------------------------------------------------------------
@@ -603,9 +808,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(400, "bad path")
             return
         qs = parse_qs(urlsplit(self.path).query)
-        if qs.get("mkdir") != ["1"]:
-            self._send_text(405, "use PUT for files, POST ?mkdir=1 for directories")
+        if qs.get("mkdir") == ["1"]:
+            self._do_mkdir(abs_path, rel, qs)
             return
+        if qs.get("append") == ["1"]:
+            self._do_append(abs_path, rel, qs)
+            return
+        self._send_text(405, "use PUT for files, POST ?mkdir=1 for directories, POST ?append=1 to append a line")
+
+    def _do_mkdir(self, abs_path, rel, qs):
         if _is_reserved(rel):
             self._send_text(403, "reserved path")
             return
@@ -620,7 +831,68 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self._send_text(500, "cannot create directory")
             return
+        _log_change(rel, "mkdir", self._request_by(qs))
         self._send_text(201, "created %s" % rel)
+
+    def _do_append(self, abs_path, rel, qs):
+        if _is_reserved(rel):
+            self._send_text(403, "reserved path")
+            return
+        if rel == "changes.json":
+            self._send_text(403, "changes.json is server-maintained")
+            return
+        if _is_talk(rel):
+            self._send_text(403, "_talk/ is append-only")
+            return
+        if abs_path.is_dir() or urlsplit(self.path).path.endswith("/"):
+            self._send_text(400, "cannot append to a directory")
+            return
+        length_hdr = self.headers.get("Content-Length")
+        if length_hdr is None:
+            self._send_text(411, "length required")
+            return
+        try:
+            length = int(length_hdr)
+        except ValueError:
+            self._send_text(400, "bad content-length")
+            return
+        if length < 0:
+            self._send_text(400, "bad content-length")
+            return
+        if length > APPEND_MAX:
+            self._send_text(413, "line too large")
+            return
+        try:
+            data = self._read_exact(length)
+        except OSError:
+            self._send_text(400, "upload failed")
+            return
+        if len(data) != length:
+            self._send_text(400, "short upload")
+            return
+        if not data.endswith(b"\n"):
+            data = data + b"\n"
+        try:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._send_text(500, "cannot create directory")
+            return
+        try:
+            with APPEND_LOCK:
+                offset = abs_path.stat().st_size if abs_path.exists() else 0
+                with open(abs_path, "ab") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                with open(abs_path, "rb") as f:
+                    total = f.read()
+                lines = total.count(b"\n")
+                size = len(total)
+        except OSError:
+            self._send_text(500, "cannot append")
+            return
+        _log_change(rel, "append", self._request_by(qs))
+        self._send_json(200, {"appended": True, "path": rel, "offset": offset, "lines": lines, "bytes": size})
 
     # -- error handling ----------------------------------------------------
     def handle_error(self, request, client_address):

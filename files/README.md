@@ -25,6 +25,12 @@ relay. Binds to the host PC's tailnet IP only (loopback test mode with
   good; MOVE renames a file or moves it to another folder; POST
   `?mkdir=1` creates a directory. Empty (0-byte) files are allowed.
   Server header reports the version.
+- v6 (2026-11-05): Unified Workspace. APPEND (`POST ?append=1`) appends
+  one line to a file atomically; every successful write is logged to a
+  server-maintained `/changes.json` sync index (`{ts, path, action, by}`);
+  when a `state.json` is created or replaced the server regenerates the
+  matching `STATUS.md` from it. `/inbox.jsonl` is the append-only message
+  log. Server header reports `muse-files/6.0`.
 
 ## Endpoints (all under the root)
 
@@ -45,6 +51,12 @@ relay. Binds to the host PC's tailnet IP only (loopback test mode with
   destination goes to `.replaced/`). A `Destination:` header works too.
 - `POST /path/?mkdir=1` - create a directory (parents too). 201 on
   create, 200 if it already exists.
+- `POST /path/file?append=1` - append one line to a file, atomically.
+  Creates the file (and parents) if missing. The body is the line; a
+  trailing newline is added if missing. Max 1 MB per append. Returns
+  JSON: `{"appended": true, "path": ..., "offset": ..., "lines": ...,
+  "bytes": ...}` (offset = byte position where the line starts, lines =
+  total line count after the append).
 - Nothing outside the root is reachable.
 
 ## Resumable uploads (for slow links)
@@ -94,6 +106,40 @@ time the connection breaks.
 - `_talk/` notes are append-only for all three: DELETE, MOVE in or out,
   and replace are all refused with 403 there. Add a new note instead.
 
+## Append and the sync index (changes.json)
+
+- `POST ?append=1` appends one line to a file. It is used for the
+  message log (`/inbox.jsonl`, one line per message) and for any other
+  append-only file. Appends are serialised, so concurrent appends never
+  interleave. `_talk/` notes refuse APPEND (403) - add a new note.
+- Every successful write (PUT, replace, MOVE, DELETE, mkdir, append)
+  appends an entry to `/changes.json`:
+  `{ts, path, action, by}` (MOVE also carries `from`). `ts` is UTC ISO
+  8601, `action` is one of put / replace / move / delete / mkdir /
+  append / generate, `by` comes from the `?by=` query parameter or the
+  `X-By:` header (default `unknown`). Each Muse polls `/changes.json`
+  (one GET) and then GETs only the paths that changed since its
+  watermark. This is the single sync index.
+- `changes.json` is server-maintained: PUT, APPEND, MOVE, and DELETE on
+  it are refused (403). GET is allowed (read-only).
+- `/inbox.jsonl` is append-only: PUT, MOVE, and DELETE on it are refused
+  (403). Messages are added with `POST /inbox.jsonl?append=1`. GET is
+  allowed.
+
+## state.json and STATUS.md
+
+- Each project (and each Violet subcategory) keeps a machine-readable
+  `state.json`: `{project, status, summary, last_updated, last_change:
+  {by, at, what}, open_items: [{item, status, owner}], key_facts: {k: v}}`.
+- When a `state.json` is created (PUT) or replaced (`PUT ?replace=1`),
+  or moved into place (MOVE), the server regenerates the matching
+  `STATUS.md` in the same directory from it (short human-readable
+  summary: title, status, summary, last change, open items, key facts).
+  The old STATUS.md is kept under `.replaced/`. The regeneration is
+  logged in changes.json as action `generate`, by `server`.
+- If a `state.json` is not valid JSON, the PUT still succeeds but
+  STATUS.md is left unchanged (and a warning is logged).
+
 ## Install (on the host PC)
 
 1. Copy `muse_files.py` (and this README) into `C:\muse-relay\`.
@@ -101,7 +147,8 @@ time the connection breaks.
    the old task, registers the new one (SYSTEM, startup, 2-minute delay),
    and starts it.
 3. Firewall rule for 8788 is created by the setup script if missing.
-4. Verify: `http://<host-tailnet-ip>:8788/` should list the project folders.
+4. Verify: `http://<host-tailnet-ip>:8788/` should list the project folders,
+   and the Server header should say `muse-files/6.0`.
 
 ## Notes
 
@@ -114,3 +161,6 @@ time the connection breaks.
 - `run_files.bat` runs the server in a window for testing (Ctrl+C stops).
 - The scheduled task's LastTaskResult 267009 means "currently running"
   (good for a long-running server). 112 means the launch failed.
+- Known gaps carried over from v5: a 0-byte PUT returns 411 (likely the
+  egress proxy stripping Content-Length: 0), and DELETE on a directory
+  returns 400.

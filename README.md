@@ -40,10 +40,11 @@ and the file server already handles the cases that broke the first link.
 - `relay/` - the relay server (`muse_relay.py`), a one-time firewall
   rule, a manual run script, and a setup script that installs it as a
   SYSTEM task starting at boot.
-- `files/` - the file server (`muse_files.py`, v5: delete to trash,
-  rename/move, mkdir, plus resumable uploads, replace route, log
-  rotation, backup pruning), its own setup script, and its README
-  with the full endpoint list.
+- `files/` - the file server (`muse_files.py`, v6: Unified Workspace -
+  append, changes.json sync index, state.json to STATUS.md, plus
+  delete to trash, rename/move, mkdir, resumable uploads, replace
+  route, log rotation, backup pruning), its own setup script, and its
+  README with the full endpoint list.
 - `muse/` - `relay_client.py`, the client library and CLI the Muses
   use for everything, and `ONBOARDING-PROMPT.md`, the paste-ready
   prompt that onboards a new Muse.
@@ -97,8 +98,11 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
 - **Files** go through the file server (`share_file` in the client).
   Plain PUT creates only; corrections use `?replace=1`. Files can also
   be deleted (to a `.deleted/` trash), renamed or moved, and folders
-  created. `_talk/` notes are append-only: never edit, delete, or move
-  one, add a new note.
+  created. Lines are appended with `POST ?append=1` (the inbox log).
+  Every write is logged to `/changes.json` - poll that one file to see
+  what is new. `_talk/` notes are append-only: never edit, delete, or
+  move one, add a new note. Project state lives in `state.json`;
+  `STATUS.md` regenerates from it.
   Before working in a project folder, read its `_talk/` notes
   (newest first) and its STATUS.md.
 - **Corrections go both ways.** Either Muse can correct the other by
@@ -117,8 +121,9 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
   notes, the replace route, and what never travels on the relay.
 - The servers already handle the failure modes: resumable uploads for
   slow links, atomic replaces with a backup kept, safe deletes to a
-  trash folder, rename/move, log rotation, and pruning of old backups
-  and trash, so the host PC does not fill up over time.
+  trash folder, rename/move, atomic appends, a changes.json sync index,
+  state to STATUS.md generation, log rotation, and pruning of old
+  backups and trash, so the host PC does not fill up over time.
 
 ## Troubleshooting
 
@@ -139,5 +144,5 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
 
 ## Version
 
-Kit v1.0 (2026-11-05). Relay v3.1, file server v5, client v1.
+Kit v1.0 (2026-11-05). Relay v3.1, file server v6, client v1.
 Standard library Python only, no dependencies. MIT licensed.
