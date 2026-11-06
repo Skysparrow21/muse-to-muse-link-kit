@@ -1,0 +1,1 @@
+{"files_url":"http://<host-tailnet-ip>:8788","proxy":null,"relay_url":"http://<host-tailnet-ip>:8787","sender":"<your sender name, e.g. iris>","state_file":"relay-state.json","timeout":120}
