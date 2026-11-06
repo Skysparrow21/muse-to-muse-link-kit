@@ -1,9 +1,16 @@
-"""Muse-to-Muse relay (v3).
+"""Muse-to-Muse relay (v3.1).
 
 Stdlib-only HTTP relay. Both Muses dial out to it; it never dials out.
 Messages are append-only JSON lines, one file per project channel.
 Files are stored per channel and announced by a text message, so the
 other Muse notices them on its normal poll.
+
+v3.1 fix: id assignment is now serialised. append_message and
+append_file_record used to read the log, compute max(id)+1, then append,
+with no lock between the steps, so two concurrent POSTs could compute
+the same next id and one message was silently lost for a poller that
+advanced its watermark past it. A module-level lock now covers the
+read, id computation, and append in both functions.
 
 One Muse's computer hosts it (the "host PC"). It binds to a tailnet IP
 only, never 0.0.0.0, and the tailnet is the only boundary (no auth).
@@ -77,6 +84,11 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 LOG_PATH = os.path.join(BASE_DIR, "relay.log")
 LOG_MAX_BYTES = 10 * 1024 * 1024
 _log_lock = threading.Lock()
+# Serialises id assignment in append_message / append_file_record. Without
+# it, two concurrent POSTs can both read the same max(id) and append two
+# records with the same id, and a poller advancing its watermark past the
+# first one never sees the other (message silently lost).
+_append_lock = threading.Lock()
 
 
 def log_line(msg):
@@ -151,17 +163,18 @@ def read_messages(channel):
 
 def append_message(channel, sender, text, extra):
     os.makedirs(DATA_DIR, exist_ok=True)
-    messages = read_messages(channel)
-    next_id = max([m.get("id", 0) for m in messages], default=0) + 1
-    record = {
-        "id": next_id,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "from": sender,
-        "text": text,
-    }
-    record.update(extra)
-    with open(channel_path(channel), "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    with _append_lock:
+        messages = read_messages(channel)
+        next_id = max([m.get("id", 0) for m in messages], default=0) + 1
+        record = {
+            "id": next_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "from": sender,
+            "text": text,
+        }
+        record.update(extra)
+        with open(channel_path(channel), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
     return next_id
 
 
@@ -186,17 +199,18 @@ def read_file_index(channel):
 
 def append_file_record(channel, sender, filename, size):
     os.makedirs(channel_files_dir(channel), exist_ok=True)
-    files = read_file_index(channel)
-    next_id = max([f.get("id", 0) for f in files], default=0) + 1
-    record = {
-        "id": next_id,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "from": sender,
-        "filename": filename,
-        "size": size,
-    }
-    with open(channel_files_index(channel), "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    with _append_lock:
+        files = read_file_index(channel)
+        next_id = max([f.get("id", 0) for f in files], default=0) + 1
+        record = {
+            "id": next_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "from": sender,
+            "filename": filename,
+            "size": size,
+        }
+        with open(channel_files_index(channel), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
     return record
 
 
