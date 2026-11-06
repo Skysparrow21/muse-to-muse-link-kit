@@ -1,4 +1,4 @@
-"""Muse-to-Muse relay (v3.1).
+"""Muse-to-Muse relay (v3.2).
 
 Stdlib-only HTTP relay. Both Muses dial out to it; it never dials out.
 Messages are append-only JSON lines, one file per project channel.
@@ -11,6 +11,13 @@ with no lock between the steps, so two concurrent POSTs could compute
 the same next id and one message was silently lost for a poller that
 advanced its watermark past it. A module-level lock now covers the
 read, id computation, and append in both functions.
+
+v3.2 fix: downloading a file with a non-latin-1 name no longer crashes.
+send_bytes used to write the raw filename into Content-Disposition, and
+http.server encodes header values as latin-1, so a non-ASCII name raised
+UnicodeEncodeError inside the handler and the client got an empty reply.
+It now sends an RFC 5987 filename* (UTF-8 percent-encoded) plus an
+ASCII fallback filename= (quotes stripped).
 
 One Muse's computer hosts it (the "host PC"). It binds to a tailnet IP
 only, never 0.0.0.0, and the tailnet is the only boundary (no auth).
@@ -70,7 +77,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 DEFAULT_PORT = 8787
 MAX_TEXT = 10000
@@ -255,9 +262,19 @@ class Handler(BaseHTTPRequestHandler):
     def send_bytes(self, status, data, filename):
         self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header(
-            "Content-Disposition", 'attachment; filename="%s"' % filename
-        )
+        # RFC 5987: a UTF-8 percent-encoded filename* for non-ASCII names,
+        # plus an ASCII fallback filename= (quotes and backslashes
+        # stripped). http.server encodes header values as latin-1, so a
+        # raw non-ASCII name here raises UnicodeEncodeError inside the
+        # handler and the client receives an empty reply. A double quote
+        # in the name would also break the quoted header value.
+        ascii_name = filename.encode("ascii", "replace").decode("ascii")
+        ascii_name = ascii_name.replace('"', "").replace("\\", "")
+        if not ascii_name:
+            ascii_name = "download"
+        disp = 'attachment; filename="%s"; filename*=UTF-8\'\'%s' % (
+            ascii_name, quote(filename, safe=""))
+        self.send_header("Content-Disposition", disp)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

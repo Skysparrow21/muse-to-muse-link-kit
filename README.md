@@ -144,5 +144,5 @@ That is the whole onboarding. If a Muse is stuck, the prompt's
 
 ## Version
 
-Kit v1.0 (2026-11-05). Relay v3.1, file server v6, client v1.
+Kit v1.0 (2026-11-05). Relay v3.2, file server v6, client v1.
 Standard library Python only, no dependencies. MIT licensed.
